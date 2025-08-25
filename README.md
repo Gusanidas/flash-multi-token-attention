@@ -183,4 +183,52 @@ However, during inference, memory bandwith is the bottleneck and increasing arit
 42. &emsp;Write $dK[J_s^{\text{eff}}:J_e^{\text{eff}}]$ back to HBM.
 43. **end Parallelize**
 
+### Algorithm 4: Fused ConvAttention Forward - Inference with K-Splitting
+**Require**: Query matrix for the last 16 tokens $Q \in \mathbb{R}^{16 \times d}$, Key matrix $K \in \mathbb{R}^{N_k \times d}$, Value matrix $V \in \mathbb{R}^{N_k \times d}$, Convolution Kernel $W \in \mathbb{R}^{k_x \times k_y}$.
+**Parameters**: Number of K-dimension splits $N_{\text{splits}}$, SRAM tile size $B_k$. Scale factor $\text{scale}$.
+**Output**: Final attention output vector $O_{\text{final}} \in \mathbb{R}^{1 \times d}$ for the last query token.
 
+1.  // **Part 1: Partial Attention Computation (fwd_inference_kernel)**
+2.  // This kernel computes partial attention outputs by splitting the Key/Value matrices along the sequence length dimension ($N_k$).
+3.  // Each thread block processes one split for a specific batch and head.
+4.  **Parallelize for** each (batch, head, k_split) triplet, where $s=1, \dots, N_{\text{splits}}$ **do**:
+5.  &emsp;Initialize partial output $O_s=(0)_{1 \times d}$, partial max $M_s=-\infty$, and partial sum $L_s=0$ in SRAM.
+6.  &emsp;Load the entire query tile $Q \in \mathbb{R}^{16 \times d}$ and convolution kernel $W$ from HBM to SRAM.
+7.  &emsp;Define the number of K-tiles for this split: $T_k = \lceil N_k / (N_{\text{splits}} \cdot B_k) \rceil$.
+8.  &emsp;**for** each K-tile $j=1, \dots, T_k$ **do**:
+9.  &emsp;&emsp;// Define indices for the current Key/Value tile of size $B_k$.
+10. &emsp;&emsp;Load K tile from HBM to SRAM.
+11. &emsp;&emsp;On chip, compute attention scores: $S_j = \text{scale} \cdot (QK^T) \in \mathbb{R}^{16 \times B_k}$.
+12. &emsp;&emsp;On chip, apply 2D convolution to the scores: $S_{j, \text{conv}} = \text{Conv2D}(S_{j}, W)$.
+13. &emsp;&emsp;Extract the scores corresponding to the last query token: $s_{j, \text{lastQ}} \in \mathbb{R}^{1 \times B_k}$.
+14. &emsp;&emsp;// --- Online Softmax Update ---
+15. &emsp;&emsp;Find the maximum value in the current tile's scores: $m_j = \max(s_{j, \text{lastQ}})$.
+16. &emsp;&emsp;Store the previous max for the split: $M_{\text{old}} = M_s$.
+17. &emsp;&emsp;Update the max for the split: $M_s = \max(M_s, m_j)$.
+18. &emsp;&emsp;Compute correction factors based on the max update: $\alpha = \exp(M_{\text{old}} - M_s)$ and $\beta = \exp(m_j - M_s)$.
+19. &emsp;&emsp;Rescale the previous partial output and sum: $O_s \leftarrow O_s \cdot \alpha$ and $L_s \leftarrow L_s \cdot \alpha$.
+20. &emsp;&emsp;Compute softmax probabilities for the current tile: $P_j = \exp(s_{j, \text{lastQ}} - M_s)$.
+21. &emsp;&emsp;Update the partial sum: $L_s \leftarrow L_s + \sum(P_j)$.
+22. &emsp;&emsp;Load the corresponding V tile from HBM to SRAM.
+23. &emsp;&emsp;Update the partial output: $O_s \leftarrow O_s + P_j V$.
+24. &emsp;**end for**
+25. &emsp;Write the final partial results for this split ($O_s, M_s, L_s$) to HBM.
+26. **end Parallelize**
+27. // **Part 2: Combine K-Splits (combine_splits_kernel)**
+28. // If $N_{\text{splits}} > 1$, this kernel is launched to combine the partial results into a final, correct output.
+29. // Each thread block combines the splits for a single (batch, head) pair.
+30. **if** $N_{\text{splits}} > 1$ **then**
+31. &emsp;**Parallelize for** each (batch, head) pair **do**:
+32. &emsp;&emsp;Load all partial results $\{O_s, M_s, L_s\}_{s=1}^{N_{\text{splits}}}$ for the current (batch, head) from HBM to SRAM.
+33. &emsp;&emsp;Initialize the combined results with the first split's values: $O_{\text{final}} = O_1, M_{\text{final}} = M_1, L_{\text{final}} = L_1$.
+34. &emsp;&emsp;**for** each subsequent split $s=2, \dots, N_{\text{splits}}$ **do**:
+35. &emsp;&emsp;&emsp;Store the previous combined max: $M_{\text{old}} = M_{\text{final}}$.
+36. &emsp;&emsp;&emsp;Find the new true maximum across the combined and current splits: $M_{\text{final}} = \max(M_{\text{final}}, M_s)$.
+37. &emsp;&emsp;&emsp;Compute correction factors: $\alpha = \exp(M_{\text{old}} - M_{\text{final}})$ and $\beta = \exp(M_s - M_{\text{final}})$.
+38. &emsp;&emsp;&emsp;Combine the output vectors with proper scaling: $O_{\text{final}} \leftarrow O_{\text{final}} \cdot \alpha + O_s \cdot \beta$.
+39. &emsp;&emsp;&emsp;Combine the sum values: $L_{\text{final}} \leftarrow L_{\text{final}} \cdot \alpha + L_s \cdot \beta$.
+40. &emsp;&emsp;**end for**
+41. &emsp;&emsp;Normalize the final output vector: $O_{\text{final}} \leftarrow O_{\text{final}} / L_{\text{final}}$.
+42. &emsp;&emsp;Write the final $O_{\text{final}}$ back to its designated position in HBM.
+43. &emsp;**end Parallelize**
+44. **end if**
