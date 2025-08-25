@@ -8,13 +8,20 @@ Implementations of multi token attention in CUDA and Triton.
 
 In this variant, there is only a convolution before the softmax. 
 
-A = Softmax Conv2dθ (Aˆ)
+$$
+A = \text{Softmax} \ \text{Conv2d}_{\theta}(\hat{A})
+$$
 
-aij = Softmax   cq−1 ∑ i ′=0 ⌈ck/2⌉−1 ∑ j ′=−⌊ck/2⌋ 1i≥j−j ′ θi ′ ,j ′ qi−i ′ k ⊤ j−j ′ / √ d
+$$
+a_{ij} = \text{Softmax} \left( \frac{c_{q-1}}{\sqrt{d}} \sum_{i'=0}^{\lceil c_k/2 \rceil-1} \sum_{j'=-\lfloor c_k/2 \rfloor}^{\lfloor c_k/2 \rfloor} 1_{i \ge j-j'} \theta_{i',j'} q_{i-i'}^{\top} k_{j-j'} \right)
+$$
 
-The output is:
+And the output:
 
-Out_j,h = ∑_i a_j,i * V_i,
+```math
+\text{Out}_{jh} = \left( \sum a_{ji} \dot V_{ih} \right)
+```
+
 
 The implementation fuses all these operations in a single CUDA kernel, using the main ideas of tiling and online softmax from Flash Attention.
 
