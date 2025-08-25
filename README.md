@@ -85,3 +85,102 @@ However, during inference, memory bandwith is the bottleneck and increasing arit
 37. &emsp;Write normalized $O[I_s^{\text{eff}}:I_e^{\text{eff}}]$ to HBM.
 38. &emsp;Write $m_i[P_q:B]$ to $M[I_s^{\text{eff}}:I_e^{\text{eff}}]$ and $\ell_i[P_q:B]$ to $L[I_s^{\text{eff}}:I_e^{\text{eff}}]$ in HBM.
 39. **end Parallelize**
+
+
+
+### Algorithm 2: Fused ConvAttention Backward - dQ and dW (dq_kernel)
+**Require**: Matrices $Q, K, V, dO \in \mathbb{R}^{N \times d}$. Statistics $L, D \in \mathbb{R}^{N}$. Convolution Kernel $W$.
+**Parameters**: SRAM tile size $B$. Padding $P_q, P_k$. Scale factor $\text{scale}$.
+
+1. Initialize $dQ=(0)_{N \times d}, dW=(0)$ in HBM.
+2. Define effective block sizes (strides): $B_r = B - 2P_q, B_c = B - 4P_k$.
+3. Calculate number of blocks: $T_r = \lceil N/B_r \rceil, T_c = \lceil N/B_c \rceil$.
+4. **Parallelize for** $i=1$ to $T_r$ **do**:
+5. &emsp;// Define indices for the loaded Q/dO tile (size $B$)
+6. &emsp; $I_s = (i-1) \cdot B_r - 2P_q$. $I_e = I_s + B$.
+7. &emsp;// Define indices for the effective output region (size $B_r$)
+8. &emsp; $I_s^{\text{eff}} = (i-1) \cdot B_r$. $I_e^{\text{eff}} = I_s^{\text{eff}} + B_r$.
+9. &emsp;Load $W$ from HBM to SRAM. Initialize local $dW_i=(0)$ accumulator in SRAM.
+10. &emsp;Load $dO[I_s:I_e], L[I_s:I_e], D[I_s:I_e]$ from HBM to SRAM.
+11. &emsp;**for** $j=1$ to $T_c$ **do**:
+12. &emsp;&emsp;// Define indices for the loaded K/V tile (size $B$)
+13. &emsp;&emsp; $J_s = (j-1) \cdot B_c - 2P_k$. $J_e = J_s + B$.
+14. &emsp;&emsp;// --- Forward Computation Reprise ---
+15. &emsp;&emsp;Load $Q[I_s:I_e], K[J_s:J_e]$ from HBM to SRAM.
+16. &emsp;&emsp;On chip, $S_{ij} = \text{scale} \cdot (Q[I_s:I_e] K[J_s:J_e]^T) \in \mathbb{R}^{B \times B}$.
+17. &emsp;&emsp; $P_{ij}^{\text{raw}} = \text{Conv2D}(S_{ij}, W)$. (Apply causal masking).
+18. &emsp;&emsp; $P_{ij} = \exp(P_{ij}^{\text{raw}} - L[I_s:I_e])$.
+19. &emsp;&emsp;// --- Backward Computation ---
+20. &emsp;&emsp;// Compute dP
+21. &emsp;&emsp;Load $V[J_s:J_e]$ from HBM to SRAM.
+22. &emsp;&emsp;On chip, $dP_{ij} = dO[I_s:I_e] V[J_s:J_e]^T$.
+23. &emsp;&emsp;// Compute dS (Backprop through Softmax)
+24. &emsp;&emsp;On chip, $dS_{ij}^{\text{conv}} = P_{ij} \odot (dP_{ij} - D[I_s:I_e])$.
+25. &emsp;&emsp;// Compute dW (Accumulate Kernel Gradient)
+26. &emsp;&emsp;On chip, $dW_i \leftarrow dW_i + \text{GradW}(S_{ij}, dS_{ij}^{\text{conv}})$.
+27. &emsp;&emsp;// Compute $d(QK^T)$ (Backprop through Convolution)
+28. &emsp;&emsp; On chip, $d(QK^T)$ = $\text{TransposedConv2D}(dS^{\text{conv}}, W)$
+29. &emsp;&emsp;// Compute dQ (Read-Modify-Write HBM)
+30. &emsp;&emsp;Load $K[J_s:J_e]$ from HBM to SRAM (if overwritten by V).
+31. &emsp;&emsp;Load $dQ[I_s:I_e]$ from HBM to SRAM accumulator $dQ_{\text{acc}}$. (If $j>1$, else initialize to 0).
+32. &emsp;&emsp;On chip, $dQ_{\text{acc}} \leftarrow dQ_{\text{acc}} + d(QK^T)_{ij} K[J_s:J_e]$.
+33. &emsp;&emsp;Write back the effective region $dQ[I_s^{\text{eff}}:I_e^{\text{eff}}]$ to HBM (unscaled).
+34. &emsp;**end for**
+35. &emsp;// Finalization
+36. &emsp;// Apply scale factor to dQ (Read-Modify-Write HBM)
+37. &emsp;Load $dQ[I_s^{\text{eff}}:I_e^{\text{eff}}]$ from HBM.
+38. &emsp; $dQ[I_s^{\text{eff}}:I_e^{\text{eff}}] \leftarrow dQ[I_s^{\text{eff}}:I_e^{\text{eff}}] \cdot \text{scale}$.
+39. &emsp;Write $dQ[I_s^{\text{eff}}:I_e^{\text{eff}}]$ back to HBM.
+40. &emsp;// Atomically update global dW
+41. &emsp;$\text{AtomicAdd}(dW, dW_i)$.
+42. **end Parallelize**
+
+### Algorithm 3: Fused ConvAttention Backward - dK and dV (dk_dv_kernel)
+**Require**: Matrices $Q, K, V, dO \in \mathbb{R}^{N \times d}$. Statistics $L, D \in \mathbb{R}^{N}$. Convolution Kernel $W$.
+**Parameters**: SRAM tile size $B$. Padding $P_q, P_k$. Scale factor $\text{scale}$.
+
+1. Initialize $dK=(0)_{N \times d}, dV=(0)_{N \times d}$ in HBM.
+2. Define effective block sizes (strides): $B_r = B - 2P_q, B_c = B - 4P_k$.
+3. Calculate number of blocks: $T_r = \lceil N/B_r \rceil, T_c = \lceil N/B_c \rceil$.
+4. **Parallelize for** $j=1$ to $T_c$ **do**:
+5. &emsp;// Define indices for the loaded K/V tile (size $B$)
+6. &emsp; $J_s = (j-1) \cdot B_c - 2P_k$. $J_e = J_s + B$.
+7. &emsp;// Define indices for the effective output region (size $B_c$)
+8. &emsp; $J_s^{\text{eff}} = (j-1) \cdot B_c$. $J_e^{\text{eff}} = J_s^{\text{eff}} + B_c$.
+9. &emsp;Load $W$ from HBM to SRAM.
+10. &emsp;**for** $i=1$ to $T_r$ **do**:
+11. &emsp;&emsp;// Define indices for the loaded Q/dO tile (size $B$)
+12. &emsp;&emsp; $I_s = (i-1) \cdot B_r - 2P_q$. $I_e = I_s + B$.
+13. &emsp;&emsp;// --- Forward Computation Reprise ---
+14. &emsp;&emsp;Load $Q[I_s:I_e], K[J_s:J_e], L[I_s:I_e], D[I_s:I_e]$ from HBM to SRAM.
+15. &emsp;&emsp;On chip, $S_{ij} = \text{scale} \cdot (Q[I_s:I_e] K[J_s:J_e]^T) \in \mathbb{R}^{B \times B}$.
+16. &emsp;&emsp; $P_{ij}^{\text{raw}} = \text{Conv2D}(S_{ij}, W)$. (Apply causal masking).
+17. &emsp;&emsp; $P_{ij} = \exp(P_{ij}^{\text{raw}} - L[I_s:I_e])$.
+18. &emsp;&emsp;// --- Backward Computation (Interleaved dV and dK) ---
+19. &emsp;&emsp;// Compute dP
+20. &emsp;&emsp;Load $dO[I_s:I_e], V[J_s:J_e]$ from HBM to SRAM (Overwrites Q, K).
+21. &emsp;&emsp;On chip, $dP_{ij} = dO[I_s:I_e] V[J_s:J_e]^T$.
+22. &emsp;&emsp;// Update dV (Read-Modify-Write HBM)
+23. &emsp;&emsp;Load $dV[J_s:J_e]$ from HBM to SRAM accumulator $dV_{\text{acc}}$. (If $i>1$, else initialize to 0).
+24. &emsp;&emsp;On chip, transpose $P_{ij} \rightarrow P_{ij}^T$.
+25. &emsp;&emsp;On chip, $dV_{\text{acc}} \leftarrow dV_{\text{acc}} + P_{ij}^T dO[I_s:I_e]$.
+26. &emsp;&emsp;Write back the effective region $dV[J_s^{\text{eff}}:J_e^{\text{eff}}]$ to HBM.
+27. &emsp;&emsp;// Compute dS (Backprop through Softmax)
+28. &emsp;&emsp;On chip, $dS_{ij}^{\text{conv}} = P_{ij} \odot (dP_{ij} - D[I_s:I_e])$.
+29. &emsp;&emsp;// Compute $d(QK^T)$ (Backprop through Convolution)
+30. &emsp;&emsp;On chip, $d({QK^T})$ = $\text{TransposedConv2D}(dS^{\text{conv}}, W)$.
+31. &emsp;&emsp;// Update dK (Read-Modify-Write HBM)
+32. &emsp;&emsp;Load $Q[I_s:I_e]$ from HBM to SRAM (was overwritten by dO).
+33. &emsp;&emsp;Load $dK[J_s:J_e]$ from HBM to SRAM accumulator $dK_{\text{acc}}$. (If $i>1$, else initialize to 0).
+34. &emsp;&emsp;On chip, transpose $d(QK^T)_{ij} \rightarrow d(QK^T)_{ij}^T$.
+35. &emsp;&emsp;On chip, $dK_{\text{acc}} \leftarrow dK_{\text{acc}} + d(QK^T)_{ij}^T Q[I_s:I_e]$.
+36. &emsp;&emsp;Write back the effective region $dK[J_s^{\text{eff}}:J_e^{\text{eff}}]$ to HBM (unscaled).
+37. &emsp;**end for**
+38. &emsp;// Finalization
+39. &emsp;// Apply scale factor to dK (Read-Modify-Write HBM). dV is already finalized.
+40. &emsp;Load $dK[J_s^{\text{eff}}:J_e^{\text{eff}}]$ from HBM.
+41. &emsp; $dK[J_s^{\text{eff}}:J_e^{\text{eff}}] \leftarrow dK[J_s^{\text{eff}}:J_e^{\text{eff}}] \cdot \text{scale}$.
+42. &emsp;Write $dK[J_s^{\text{eff}}:J_e^{\text{eff}}]$ back to HBM.
+43. **end Parallelize**
+
+
