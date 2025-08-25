@@ -232,3 +232,5 @@ However, during inference, memory bandwith is the bottleneck and increasing arit
 42. &emsp;&emsp;Write the final $O_{\text{final}}$ back to its designated position in HBM.
 43. &emsp;**end Parallelize**
 44. **end if**
+
+## Head Conv ##
